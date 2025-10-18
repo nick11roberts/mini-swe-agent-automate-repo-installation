@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-End Repository Profile Generation
+End-to-End Repository Profile Generation (Interactive Version)
 
 This script orchestrates the complete 3-stage pipeline to generate repository profiles:
 1. simple_repo_to_dockerfile.py - Generate Dockerfile/conda script + metadata
@@ -9,9 +9,15 @@ This script orchestrates the complete 3-stage pipeline to generate repository pr
 
 Produces a profile class ready for integration into the profile registry.
 
+Interactive Mode Features:
+- When stages 1 or 2 fail, allows manual editing of Dockerfile/install script
+- Provides retry functionality after manual edits
+- Shows current file content and prompts for editing options
+
 Usage:
-    python generate_profile.py owner/repo --python-repo  # For Python repos
-    python generate_profile.py owner/repo               # For non-Python repos
+    python generate_profile_interactive.py owner/repo --python-repo  # For Python repos
+    python generate_profile_interactive.py owner/repo               # For non-Python repos
+    python generate_profile_interactive.py owner/repo --interactive # Enable manual editing on failures
 """
 
 import argparse
@@ -572,8 +578,127 @@ WORKDIR /testbed
     return profile_code
 
 
+def regenerate_profile_after_edit(result_dir: Path, owner: str, repo: str, is_python_repo: bool) -> None:
+    """Regenerate the profile class after successful interactive editing."""
+    print(f"\n🔄 Regenerating profile class with updated Dockerfile...")
+    
+    # Load updated metadata
+    metadata = load_metadata(result_dir)
+    parsed_results = load_parsed_results(result_dir)
+    
+    if not metadata:
+        print("❌ Cannot regenerate profile without metadata")
+        return
+    
+    # Load the updated Dockerfile/install script
+    if is_python_repo:
+        install_script = load_install_script(result_dir)
+        profile_code = generate_python_profile_class(owner, repo, metadata, parsed_results, install_script)
+    else:
+        dockerfile_content = load_dockerfile(result_dir)
+        if metadata.get('language', '').lower() == 'javascript':
+            profile_code = generate_javascript_profile_class(owner, repo, metadata, parsed_results, dockerfile_content)
+        else:
+            profile_code = generate_generic_profile_class(owner, repo, metadata, parsed_results, dockerfile_content)
+    
+    # Save the updated profile class
+    class_name = create_class_name(owner, repo, metadata.get('commit_hash', ''))
+    profile_file = save_profile_class(result_dir, profile_code, class_name)
+    print(f"✅ Updated profile class saved to: {profile_file}")
+
+
+def prompt_for_manual_edit(result_dir: Path, is_python_repo: bool) -> bool:
+    """Prompt user to manually edit Dockerfile/install script and return True if they want to retry."""
+    print("\n" + "=" * 60)
+    print("🔧 INTERACTIVE MODE: Manual Editing Available")
+    print("=" * 60)
+    
+    if is_python_repo:
+        # Find install script for Python repos
+        install_scripts = list(result_dir.glob("*_install.sh"))
+        if install_scripts:
+            target_file = install_scripts[0]
+            file_type = "conda installation script"
+        else:
+            print("❌ No installation script found to edit")
+            return False
+    else:
+        # Dockerfile for non-Python repos
+        target_file = result_dir / "Dockerfile"
+        file_type = "Dockerfile"
+    
+    if not target_file.exists():
+        print(f"❌ {file_type} not found at {target_file}")
+        return False
+    
+    print(f"📝 {file_type} location: {target_file}")
+    print(f"📋 Current content:")
+    print("-" * 50)
+    try:
+        with open(target_file, 'r') as f:
+            content = f.read()
+            print(content)
+    except Exception as e:
+        print(f"❌ Error reading file: {e}")
+        return False
+    print("-" * 50)
+    
+    while True:
+        print(f"\n🔧 Options:")
+        print(f"   1. Edit {file_type} manually")
+        print(f"   2. Skip editing and retry with current file")
+        print(f"   3. Skip editing and continue pipeline")
+        print(f"   4. Abort pipeline")
+        
+        choice = input("\nEnter your choice (1-4): ").strip()
+        
+        if choice == "1":
+            print(f"\n📝 Please edit the {file_type} at: {target_file}")
+            print("   After editing, press Enter to continue...")
+            input()
+            
+            # Verify the file still exists and has content
+            if target_file.exists():
+                try:
+                    with open(target_file, 'r') as f:
+                        new_content = f.read().strip()
+                    if new_content:
+                        print(f"✅ {file_type} updated successfully")
+                        return True
+                    else:
+                        print(f"⚠️  {file_type} appears to be empty")
+                        continue
+                except Exception as e:
+                    print(f"❌ Error reading updated file: {e}")
+                    continue
+            else:
+                print(f"❌ {file_type} no longer exists")
+                continue
+                
+        elif choice == "2":
+            print(f"✅ Retrying with current {file_type}")
+            return True
+            
+        elif choice == "3":
+            print(f"⚠️  Continuing pipeline with current {file_type}")
+            return False
+            
+        elif choice == "4":
+            print("🛑 Pipeline aborted by user")
+            return False
+            
+        else:
+            print("❌ Invalid choice. Please enter 1, 2, 3, or 4.")
+
+
+def retry_stage(stage_num: int, cmd: list, description: str, livestream: bool = False) -> Tuple[int, str]:
+    """Retry a pipeline stage with the same command."""
+    print(f"\n🔄 Retrying Stage {stage_num}: {description}")
+    return run_pipeline_command(cmd, f"Stage {stage_num} (Retry): {description}", livestream=livestream)
+
+
 def run_pipeline(repo_name: str, is_python_repo: bool, model_name: str = "claude-sonnet-4-20250514",
-                 livestream: bool = False) -> Dict[str, Any]:
+                 livestream: bool = False, interactive: bool = False) -> Dict[str, Any]:
     """Run the complete 3-stage pipeline with full output capture."""
     owner, repo = validate_repo_name(repo_name)
     result_dir = Path("agent-result") / f"{owner}-{repo}"
@@ -618,7 +743,32 @@ def run_pipeline(repo_name: str, is_python_repo: bool, model_name: str = "claude
         if exit_code != 0:
             print(f"❌ Stage 1 failed with exit code {exit_code}")
             print(f"Output: {output}")
-            return pipeline_results
+            
+            if interactive:
+                print(f"\n🔧 Interactive mode: Stage 1 failed - checking for generated files...")
+                # Check if any files were generated despite the failure
+                dockerfile_exists = (result_dir / "Dockerfile").exists()
+                install_scripts = list(result_dir.glob("*_install.sh"))
+                
+                if dockerfile_exists or install_scripts:
+                    print(f"✅ Some files were generated despite failure - you can edit them")
+                    if prompt_for_manual_edit(result_dir, is_python_repo):
+                        # Retry Stage 1
+                        exit_code, output = retry_stage(1, stage1_cmd, "Generating Dockerfile/conda script + metadata", livestream)
+                        pipeline_results['stages']['stage1'] = {'success': exit_code == 0, 'output': output}
+                        
+                        if exit_code != 0:
+                            print(f"❌ Stage 1 retry also failed")
+                            return pipeline_results
+                        else:
+                            print(f"✅ Stage 1 retry completed successfully")
+                    else:
+                        return pipeline_results
+                else:
+                    print(f"❌ No files generated - Stage 1 must succeed to continue")
+                    return pipeline_results
+            else:
+                return pipeline_results
 
         print(f"✅ Stage 1 completed successfully")
 
@@ -638,8 +788,28 @@ def run_pipeline(repo_name: str, is_python_repo: bool, model_name: str = "claude
         if exit_code != 0:
             print(f"❌ Stage 2 failed with exit code {exit_code}")
             print(f"Output: {output}")
-            print(f"🛑 Pipeline stopped - Stage 2 failure prevents Stage 3 execution")
-            return pipeline_results
+            
+            if interactive:
+                print(f"\n🔧 Interactive mode: Stage 2 failed - you can edit the Dockerfile/install script")
+                if prompt_for_manual_edit(result_dir, is_python_repo):
+                    # Retry Stage 2
+                    exit_code, output = retry_stage(2, stage2_cmd, "Running verification and tests", livestream)
+                    pipeline_results['stages']['stage2'] = {'success': exit_code == 0, 'output': output}
+                    
+                    if exit_code != 0:
+                        print(f"❌ Stage 2 retry also failed")
+                        print(f"🛑 Pipeline stopped - Stage 2 failure prevents Stage 3 execution")
+                        return pipeline_results
+                    else:
+                        print(f"✅ Stage 2 retry completed successfully")
+                        # Regenerate profile class with updated Dockerfile
+                        regenerate_profile_after_edit(result_dir, owner, repo, is_python_repo)
+                else:
+                    print(f"🛑 Pipeline stopped - Stage 2 failure prevents Stage 3 execution")
+                    return pipeline_results
+            else:
+                print(f"🛑 Pipeline stopped - Stage 2 failure prevents Stage 3 execution")
+                return pipeline_results
         else:
             print(f"✅ Stage 2 completed successfully")
 
@@ -798,9 +968,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Examples:
-          python generate_profile.py fastapi/typer --python-repo
-          python generate_profile.py expressjs/express
-          python generate_profile.py rust-lang/cargo --model gpt-4o-mini
+          python generate_profile_interactive.py fastapi/typer --python-repo
+          python generate_profile_interactive.py expressjs/express
+          python generate_profile_interactive.py rust-lang/cargo --model gpt-4o-mini
+          python generate_profile_interactive.py owner/repo --interactive  # Enable manual editing on failures
         """)
     )
 
@@ -832,6 +1003,11 @@ def main():
         action="store_true",
         help="Enable livestream output for pipeline stages (default: False)"
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Enable interactive mode for manual editing when stages fail (default: False)"
+    )
 
     args = parser.parse_args()
 
@@ -840,7 +1016,7 @@ def main():
         owner, repo = validate_repo_name(args.repo_name)
 
         # Run the complete pipeline
-        pipeline_results = run_pipeline(args.repo_name, args.python_repo, args.model, args.livestream)
+        pipeline_results = run_pipeline(args.repo_name, args.python_repo, args.model, args.livestream, args.interactive)
 
         # Generate profile
         profile_code = generate_profile_from_pipeline(pipeline_results, args.python_repo)
